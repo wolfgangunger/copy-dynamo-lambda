@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Lambda to copy data from one DynamoDB table to another"
+
+Parameters:
+
+  AccountName:
+    Description: Account name, used to prefix resources
+    Type: String
+
+  OwnerName:
+    Description: An owner name, used in tags
+    Type: String
+
+  SourceTableName:  
+    Description: DynamoDB table name to copy data from
+    Type: String
+
+  DestinationTableName:  
+    Description: DynamoDB table name to copy data to
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: !Sub "${AccountName}-lambda-dynamodb-table-copy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: 
+                - "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SourceTableName}"
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: 
+                - "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DestinationTableName}"
+      Tags:
+        - Key: Name
+          Value: "LambdaExecutionRole"
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  ########## lambdas 
+  CopyDynamoTableLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      FunctionName: !Sub "${AccountName}-lambda-copy-dynamodb-table"
+      Role:
+        "Fn::GetAtt":
+          - LambdaExecutionRole
+          - Arn
+      Handler: index.handler
+      Environment:
+        Variables:
+          SourceTable: !Ref SourceTableName
+          DestinationTable: !Ref DestinationTableName
+      Code:
+        ZipFile: |
+          import boto3
+          import sys
+          import os
+
+          def handler(event, context):
+                  
+              src_table = os.environ['SourceTable']
+              dst_table = os.environ['DestinationTable']
+
+              print( "DynamoDB: copy items {0} --> {1}".format(src_table, dst_table))
+
+              # create client
+              dynamo_client = boto3.client('dynamodb')
+
+              # scan
+              dynamo_items = []
+              api_response = dynamo_client.scan(TableName=src_table,Select='ALL_ATTRIBUTES')
+              dynamo_items.extend(api_response['Items'])
+              print( "Collected total {0} items from table {1}".format(len(dynamo_items), src_table))
+
+              while 'LastEvaluatedKey' in api_response:
+                  api_response = dynamo_client.scan(TableName=src_table,
+                      Select='ALL_PROJECTED_ATTRIBUTES',
+                      ExclusiveStartKey=api_response['LastEvaluatedKey'])
+                  dynamo_items.extend(api_response['Items'])
+                  print( "Collected total {0} items from table {1}".format(len(dynamo_items), src_table))
+
+              # split all items into chunks
+              chunk_size = 20
+              current_chunk = []
+              chunks = [current_chunk]
+              for item in dynamo_items:
+                  current_chunk.append(item)
+                  if len(current_chunk) == chunk_size:
+                      current_chunk = []
+                      chunks.append(current_chunk)
+
+              for index, chunk in enumerate(chunks):
+                  print( "Writing chunk {0} out of {1} to table {2}".format(
+                      index+1,
+                      len(chunks),
+                      dst_table
+                  ))
+                  if len(chunk) > 0:
+                      write_request = {}
+                      write_request[dst_table] = list(map(lambda x:{'PutRequest':{'Item':x}}, chunk))
+                      dynamo_client.batch_write_item(RequestItems=write_request)
+                  else:
+                      print ("No items in chunk - chunk empty")
+
+
+      Description: Copy data from one DynamoDB table to another
+      Tags:
+        - Key: Name
+          Value: "DynamoDBTableCopyLambda"
+        - Key: Owner
+          Value: !Ref OwnerName
+
